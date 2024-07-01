@@ -130,6 +130,10 @@ SDT_PROBE_DEFINE2(pf, ip, , bound_iface, "struct pf_kstate *",
     "struct pfi_kkif *");
 SDT_PROBE_DEFINE4(pf, sctp, multihome, test, "struct pfi_kkif *",
     "struct pf_krule *", "struct mbuf *", "int");
+SDT_PROBE_DEFINE2(pf, sctp, multihome, add, "uint32_t",
+    "struct pf_sctp_source *");
+SDT_PROBE_DEFINE3(pf, sctp, multihome, remove, "uint32_t",
+    "struct pf_kstate *", "struct pf_sctp_source *");
 
 SDT_PROBE_DEFINE3(pf, eth, test_rule, entry, "int", "struct ifnet *",
     "struct mbuf *");
@@ -359,7 +363,7 @@ static void		 pf_print_state_parts(struct pf_kstate *,
 static void		 pf_patch_8(struct mbuf *, u_int16_t *, u_int8_t *, u_int8_t,
 			    bool, u_int8_t);
 static struct pf_kstate	*pf_find_state(struct pfi_kkif *,
-			    struct pf_state_key_cmp *, u_int);
+			    const struct pf_state_key_cmp *, u_int);
 static int		 pf_src_connlimit(struct pf_kstate **);
 static void		 pf_overload_task(void *v, int pending);
 static u_short		 pf_insert_src_node(struct pf_ksrc_node **,
@@ -650,11 +654,11 @@ pf_packet_rework_nat(struct mbuf *m, struct pf_pdesc *pd, int off,
 }
 
 static __inline uint32_t
-pf_hashkey(struct pf_state_key *sk)
+pf_hashkey(const struct pf_state_key *sk)
 {
 	uint32_t h;
 
-	h = murmur3_32_hash32((uint32_t *)sk,
+	h = murmur3_32_hash32((const uint32_t *)sk,
 	    sizeof(struct pf_state_key_cmp)/sizeof(uint32_t),
 	    V_pf_hashseed);
 
@@ -723,14 +727,11 @@ pf_addrcpy(struct pf_addr *dst, struct pf_addr *src, sa_family_t af)
 	switch (af) {
 #ifdef INET
 	case AF_INET:
-		dst->addr32[0] = src->addr32[0];
+		memcpy(&dst->v4, &src->v4, sizeof(dst->v4));
 		break;
 #endif /* INET */
 	case AF_INET6:
-		dst->addr32[0] = src->addr32[0];
-		dst->addr32[1] = src->addr32[1];
-		dst->addr32[2] = src->addr32[2];
-		dst->addr32[3] = src->addr32[3];
+		memcpy(&dst->v6, &src->v6, sizeof(dst->v6));
 		break;
 	}
 }
@@ -1505,7 +1506,7 @@ pf_state_key_setup(struct pf_pdesc *pd, struct pf_addr *saddr,
 }
 
 struct pf_state_key *
-pf_state_key_clone(struct pf_state_key *orig)
+pf_state_key_clone(const struct pf_state_key *orig)
 {
 	struct pf_state_key *sk;
 
@@ -1606,7 +1607,8 @@ pf_find_state_byid(uint64_t id, uint32_t creatorid)
  * Returns with ID hash slot locked on success.
  */
 static struct pf_kstate *
-pf_find_state(struct pfi_kkif *kif, struct pf_state_key_cmp *key, u_int dir)
+pf_find_state(struct pfi_kkif *kif, const struct pf_state_key_cmp *key,
+    u_int dir)
 {
 	struct pf_keyhash	*kh;
 	struct pf_state_key	*sk;
@@ -1615,7 +1617,7 @@ pf_find_state(struct pfi_kkif *kif, struct pf_state_key_cmp *key, u_int dir)
 
 	pf_counter_u64_add(&V_pf_status.fcounters[FCNT_STATE_SEARCH], 1);
 
-	kh = &V_pf_keyhash[pf_hashkey((struct pf_state_key *)key)];
+	kh = &V_pf_keyhash[pf_hashkey((const struct pf_state_key *)key)];
 
 	PF_HASHROW_LOCK(kh);
 	LIST_FOREACH(sk, &kh->keys, entry)
@@ -1653,7 +1655,7 @@ pf_find_state(struct pfi_kkif *kif, struct pf_state_key_cmp *key, u_int dir)
  * Returns with ID hash slot locked on success.
  */
 struct pf_kstate *
-pf_find_state_all(struct pf_state_key_cmp *key, u_int dir, int *more)
+pf_find_state_all(const struct pf_state_key_cmp *key, u_int dir, int *more)
 {
 	struct pf_keyhash	*kh;
 	struct pf_state_key	*sk;
@@ -1662,7 +1664,7 @@ pf_find_state_all(struct pf_state_key_cmp *key, u_int dir, int *more)
 
 	pf_counter_u64_add(&V_pf_status.fcounters[FCNT_STATE_SEARCH], 1);
 
-	kh = &V_pf_keyhash[pf_hashkey((struct pf_state_key *)key)];
+	kh = &V_pf_keyhash[pf_hashkey((const struct pf_state_key *)key)];
 
 	PF_HASHROW_LOCK(kh);
 	LIST_FOREACH(sk, &kh->keys, entry)
@@ -1719,7 +1721,7 @@ second_run:
  * removing it.
  */
 bool
-pf_find_state_all_exists(struct pf_state_key_cmp *key, u_int dir)
+pf_find_state_all_exists(const struct pf_state_key_cmp *key, u_int dir)
 {
 	struct pf_kstate *s;
 
@@ -3408,21 +3410,13 @@ pf_match_addr(u_int8_t n, struct pf_addr *a, struct pf_addr *m,
 	switch (af) {
 #ifdef INET
 	case AF_INET:
-		if ((a->addr32[0] & m->addr32[0]) ==
-		    (b->addr32[0] & m->addr32[0]))
+		if (IN_ARE_MASKED_ADDR_EQUAL(a->v4, b->v4, m->v4))
 			match++;
 		break;
 #endif /* INET */
 #ifdef INET6
 	case AF_INET6:
-		if (((a->addr32[0] & m->addr32[0]) ==
-		     (b->addr32[0] & m->addr32[0])) &&
-		    ((a->addr32[1] & m->addr32[1]) ==
-		     (b->addr32[1] & m->addr32[1])) &&
-		    ((a->addr32[2] & m->addr32[2]) ==
-		     (b->addr32[2] & m->addr32[2])) &&
-		    ((a->addr32[3] & m->addr32[3]) ==
-		     (b->addr32[3] & m->addr32[3])))
+		if (IN6_ARE_MASKED_ADDR_EQUAL(&a->v6, &b->v6, &m->v6))
 			match++;
 		break;
 #endif /* INET6 */
@@ -5253,7 +5247,7 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 	struct tcphdr		*th = &pd->hdr.tcp;
 	struct pf_state_peer	*src, *dst;
 	u_int16_t		 win = ntohs(th->th_win);
-	u_int32_t		 ack, end, seq, orig_seq;
+	u_int32_t		 ack, end, data_end, seq, orig_seq;
 	u_int8_t		 sws, dws, psrc, pdst;
 	int			 ackskew;
 
@@ -5322,13 +5316,15 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 					dws = dst->wscale & PF_WSCALE_MASK;
 				} else {
 					/* fixup other window */
-					dst->max_win <<= dst->wscale &
-					    PF_WSCALE_MASK;
+					dst->max_win = MIN(TCP_MAXWIN,
+					    (u_int32_t)dst->max_win <<
+					    (dst->wscale & PF_WSCALE_MASK));
 					/* in case of a retrans SYN|ACK */
 					dst->wscale = 0;
 				}
 			}
 		}
+		data_end = end;
 		if (th->th_flags & TH_FIN)
 			end++;
 
@@ -5359,6 +5355,7 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 		end = seq + pd->p_len;
 		if (th->th_flags & TH_SYN)
 			end++;
+		data_end = end;
 		if (th->th_flags & TH_FIN)
 			end++;
 	}
@@ -5380,7 +5377,7 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 	if (seq == end) {
 		/* Ease sequencing restrictions on no data packets */
 		seq = src->seqlo;
-		end = seq;
+		data_end = end = seq;
 	}
 
 	ackskew = dst->seqlo - ack;
@@ -5403,7 +5400,7 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 	}
 
 #define	MAXACKWINDOW (0xffff + 1500)	/* 1500 is an arbitrary fudge factor */
-	if (SEQ_GEQ(src->seqhi, end) &&
+	if (SEQ_GEQ(src->seqhi, data_end) &&
 	    /* Last octet inside other's window space */
 	    SEQ_GEQ(seq, src->seqlo - (dst->max_win << dws)) &&
 	    /* Retrans: not more than one window back */
@@ -5477,7 +5474,7 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 	} else if ((dst->state < TCPS_SYN_SENT ||
 		dst->state >= TCPS_FIN_WAIT_2 ||
 		src->state >= TCPS_FIN_WAIT_2) &&
-	    SEQ_GEQ(src->seqhi + MAXACKWINDOW, end) &&
+	    SEQ_GEQ(src->seqhi + MAXACKWINDOW, data_end) &&
 	    /* Within a window forward of the originating packet */
 	    SEQ_GEQ(seq, src->seqlo - MAXACKWINDOW)) {
 	    /* Within a window backward of the originating packet */
@@ -5570,12 +5567,12 @@ pf_tcp_track_full(struct pf_kstate **state, struct pfi_kkif *kif,
 			    pd->dir == PF_IN ? "in" : "out",
 			    pd->dir == (*state)->direction ? "fwd" : "rev");
 			printf("pf: State failure on: %c %c %c %c | %c %c\n",
-			    SEQ_GEQ(src->seqhi, end) ? ' ' : '1',
+			    SEQ_GEQ(src->seqhi, data_end) ? ' ' : '1',
 			    SEQ_GEQ(seq, src->seqlo - (dst->max_win << dws)) ?
 			    ' ': '2',
 			    (ackskew >= -MAXACKWINDOW) ? ' ' : '3',
 			    (ackskew <= (MAXACKWINDOW << sws)) ? ' ' : '4',
-			    SEQ_GEQ(src->seqhi + MAXACKWINDOW, end) ?' ' :'5',
+			    SEQ_GEQ(src->seqhi + MAXACKWINDOW, data_end) ?' ' :'5',
 			    SEQ_GEQ(seq, src->seqlo - MAXACKWINDOW) ?' ' :'6');
 		}
 		REASON_SET(reason, PFRES_BADSTATE);
@@ -6042,11 +6039,12 @@ pf_sctp_multihome_detach_addr(const struct pf_kstate *s)
 	key.v_tag = s->dst.scrub->pfss_v_tag;
 	ep  = RB_FIND(pf_sctp_endpoints, &V_pf_sctp_endpoints, &key);
 	if (ep != NULL) {
-		/* XXX Actually remove! */
 		TAILQ_FOREACH_SAFE(i, &ep->sources, entry, tmp) {
 			if (pf_addr_cmp(&i->addr,
 			    &s->key[PF_SK_WIRE]->addr[s->direction == PF_OUT],
 			    s->key[PF_SK_WIRE]->af) == 0) {
+				SDT_PROBE3(pf, sctp, multihome, remove,
+				    key.v_tag, s, i);
 				TAILQ_REMOVE(&ep->sources, i, entry);
 				free(i, M_PFTEMP);
 				break;
@@ -6067,6 +6065,8 @@ pf_sctp_multihome_detach_addr(const struct pf_kstate *s)
 			if (pf_addr_cmp(&i->addr,
 			    &s->key[PF_SK_WIRE]->addr[s->direction == PF_IN],
 			    s->key[PF_SK_WIRE]->af) == 0) {
+				SDT_PROBE3(pf, sctp, multihome, remove,
+				    key.v_tag, s, i);
 				TAILQ_REMOVE(&ep->sources, i, entry);
 				free(i, M_PFTEMP);
 				break;
@@ -6124,6 +6124,7 @@ pf_sctp_multihome_add_addr(struct pf_pdesc *pd, struct pf_addr *a, uint32_t v_ta
 	i->af = pd->af;
 	memcpy(&i->addr, a, sizeof(*a));
 	TAILQ_INSERT_TAIL(&ep->sources, i, entry);
+	SDT_PROBE2(pf, sctp, multihome, add, v_tag, i);
 
 	PF_SCTP_ENDPOINTS_UNLOCK();
 }

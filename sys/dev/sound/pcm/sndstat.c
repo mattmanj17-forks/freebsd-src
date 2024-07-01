@@ -45,9 +45,6 @@
 #include <sys/nv.h>
 #include <sys/dnv.h>
 #include <sys/sx.h>
-#ifdef COMPAT_FREEBSD32
-#include <sys/sysent.h>
-#endif
 
 #include <dev/sound/pcm/sound.h>
 #include <dev/sound/pcm/pcm.h>
@@ -330,7 +327,6 @@ sndstat_get_caps(struct snddev_info *d, bool play, uint32_t *min_rate,
     uint32_t *max_rate, uint32_t *fmts, uint32_t *minchn, uint32_t *maxchn)
 {
 	struct pcm_channel *c;
-	unsigned int encoding;
 	int dir;
 
 	dir = play ? PCMDIR_PLAY : PCMDIR_REC;
@@ -347,11 +343,11 @@ sndstat_get_caps(struct snddev_info *d, bool play, uint32_t *min_rate,
 		return;
 	}
 
+	*fmts = 0;
 	*min_rate = UINT32_MAX;
 	*max_rate = 0;
 	*minchn = UINT32_MAX;
 	*maxchn = 0;
-	encoding = 0;
 	CHN_FOREACH(c, d, channels.pcm) {
 		struct pcmchan_caps *caps;
 		int i;
@@ -364,9 +360,9 @@ sndstat_get_caps(struct snddev_info *d, bool play, uint32_t *min_rate,
 		*min_rate = min(caps->minspeed, *min_rate);
 		*max_rate = max(caps->maxspeed, *max_rate);
 		for (i = 0; caps->fmtlist[i]; i++) {
-			encoding |= AFMT_ENCODING(caps->fmtlist[i]);
-			*minchn = min(AFMT_CHANNEL(encoding), *minchn);
-			*maxchn = max(AFMT_CHANNEL(encoding), *maxchn);
+			*fmts |= AFMT_ENCODING(caps->fmtlist[i]);
+			*minchn = min(AFMT_CHANNEL(caps->fmtlist[i]), *minchn);
+			*maxchn = max(AFMT_CHANNEL(caps->fmtlist[i]), *maxchn);
 		}
 		CHN_UNLOCK(c);
 	}
@@ -396,9 +392,12 @@ sndstat_create_diinfo_nv(uint32_t min_rate, uint32_t max_rate, uint32_t formats,
 static int
 sndstat_build_sound4_nvlist(struct snddev_info *d, nvlist_t **dip)
 {
+	struct pcm_channel *c;
+	struct pcm_feeder *f;
+	struct sbuf sb;
 	uint32_t maxrate, minrate, fmts, minchn, maxchn;
-	nvlist_t *di = NULL, *sound4di = NULL, *diinfo = NULL;
-	int err;
+	nvlist_t *di = NULL, *sound4di = NULL, *diinfo = NULL, *cdi = NULL;
+	int err, nchan;
 
 	di = nvlist_create(0);
 	if (di == NULL) {
@@ -455,8 +454,116 @@ sndstat_build_sound4_nvlist(struct snddev_info *d, nvlist_t **dip)
 	    sound4di, SNDST_DSPS_SOUND4_BITPERFECT, d->flags & SD_F_BITPERFECT);
 	nvlist_add_number(sound4di, SNDST_DSPS_SOUND4_PVCHAN, d->pvchancount);
 	nvlist_add_number(sound4di, SNDST_DSPS_SOUND4_RVCHAN, d->rvchancount);
+
+	nchan = 0;
+	CHN_FOREACH(c, d, channels.pcm) {
+		sbuf_new(&sb, NULL, 4096, SBUF_AUTOEXTEND);
+		cdi = nvlist_create(0);
+		if (cdi == NULL) {
+			sbuf_delete(&sb);
+			PCM_RELEASE_QUICK(d);
+			err = ENOMEM;
+			goto done;
+		}
+
+		nvlist_add_string(cdi, SNDST_DSPS_SOUND4_CHAN_NAME, c->name);
+		nvlist_add_string(cdi, SNDST_DSPS_SOUND4_CHAN_PARENTCHAN,
+		    c->parentchannel != NULL ? c->parentchannel->name : "");
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_UNIT, nchan++);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_LATENCY,
+		    c->latency);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_RATE, c->speed);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_FORMAT,
+		    c->format);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_PID, c->pid);
+		nvlist_add_string(cdi, SNDST_DSPS_SOUND4_CHAN_COMM, c->comm);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_INTR,
+		    c->interrupts);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_FEEDCNT,
+		    c->feedcount);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_XRUNS, c->xruns);
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_LEFTVOL,
+		    CHN_GETVOLUME(c, SND_VOL_C_PCM, SND_CHN_T_FL));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_RIGHTVOL,
+		    CHN_GETVOLUME(c, SND_VOL_C_PCM, SND_CHN_T_FR));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_HWBUF_FORMAT,
+		    sndbuf_getfmt(c->bufhard));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_HWBUF_SIZE,
+		    sndbuf_getsize(c->bufhard));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_HWBUF_BLKSZ,
+		    sndbuf_getblksz(c->bufhard));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_HWBUF_BLKCNT,
+		    sndbuf_getblkcnt(c->bufhard));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_HWBUF_FREE,
+		    sndbuf_getfree(c->bufhard));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_HWBUF_READY,
+		    sndbuf_getready(c->bufhard));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_SWBUF_FORMAT,
+		    sndbuf_getfmt(c->bufsoft));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_SWBUF_SIZE,
+		    sndbuf_getsize(c->bufsoft));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_SWBUF_BLKSZ,
+		    sndbuf_getblksz(c->bufsoft));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_SWBUF_BLKCNT,
+		    sndbuf_getblkcnt(c->bufsoft));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_SWBUF_FREE,
+		    sndbuf_getfree(c->bufsoft));
+		nvlist_add_number(cdi, SNDST_DSPS_SOUND4_CHAN_SWBUF_READY,
+		    sndbuf_getready(c->bufsoft));
+
+		sbuf_printf(&sb, "[%s",
+		    (c->direction == PCMDIR_REC) ? "hardware" : "userland");
+		sbuf_printf(&sb, " -> ");
+		f = c->feeder;
+		while (f->source != NULL)
+			f = f->source;
+		while (f != NULL) {
+			sbuf_printf(&sb, "%s", f->class->name);
+			if (f->desc->type == FEEDER_FORMAT) {
+				sbuf_printf(&sb, "(0x%08x -> 0x%08x)",
+				    f->desc->in, f->desc->out);
+			} else if (f->desc->type == FEEDER_MATRIX) {
+				sbuf_printf(&sb, "(%d.%d -> %d.%d)",
+				    AFMT_CHANNEL(f->desc->in) -
+				    AFMT_EXTCHANNEL(f->desc->in),
+				    AFMT_EXTCHANNEL(f->desc->in),
+				    AFMT_CHANNEL(f->desc->out) -
+				    AFMT_EXTCHANNEL(f->desc->out),
+				    AFMT_EXTCHANNEL(f->desc->out));
+			} else if (f->desc->type == FEEDER_RATE) {
+				sbuf_printf(&sb,
+				    "(0x%08x q:%d %d -> %d)",
+				    f->desc->out,
+				    FEEDER_GET(f, FEEDRATE_QUALITY),
+				    FEEDER_GET(f, FEEDRATE_SRC),
+				    FEEDER_GET(f, FEEDRATE_DST));
+			} else {
+				sbuf_printf(&sb, "(0x%08x)",
+				    f->desc->out);
+			}
+			sbuf_printf(&sb, " -> ");
+			f = f->parent;
+		}
+		sbuf_printf(&sb, "%s]",
+		    (c->direction == PCMDIR_REC) ? "userland" : "hardware");
+
+		sbuf_finish(&sb);
+		nvlist_add_string(cdi, SNDST_DSPS_SOUND4_CHAN_FEEDERCHAIN,
+		    sbuf_data(&sb));
+		sbuf_delete(&sb);
+
+		nvlist_append_nvlist_array(sound4di,
+		    SNDST_DSPS_SOUND4_CHAN_INFO, cdi);
+		nvlist_destroy(cdi);
+		err = nvlist_error(sound4di);
+		if (err) {
+			PCM_RELEASE_QUICK(d);
+			goto done;
+		}
+	}
 	nvlist_move_nvlist(di, SNDST_DSPS_PROVIDER_INFO, sound4di);
 	sound4di = NULL;
+
 	PCM_RELEASE_QUICK(d);
 	nvlist_add_string(di, SNDST_DSPS_PROVIDER, SNDST_DSPS_SOUND4_PROVIDER);
 
@@ -623,10 +730,9 @@ sndstat_refresh_devs(struct sndstat_file *pf)
 }
 
 static int
-sndstat_get_devs(struct sndstat_file *pf, caddr_t data)
+sndstat_get_devs(struct sndstat_file *pf, void *arg_buf, size_t *arg_nbytes)
 {
 	int err;
-	struct sndstioc_nv_arg *arg = (struct sndstioc_nv_arg *)data;
 
 	SNDSTAT_LOCK();
 	sx_xlock(&pf->lock);
@@ -665,22 +771,22 @@ sndstat_get_devs(struct sndstat_file *pf, caddr_t data)
 
 	SNDSTAT_UNLOCK();
 
-	if (!arg->nbytes) {
-		arg->nbytes = pf->devs_nbytes;
+	if (*arg_nbytes == 0) {
+		*arg_nbytes = pf->devs_nbytes;
 		err = 0;
 		goto done;
 	}
-	if (arg->nbytes < pf->devs_nbytes) {
-		arg->nbytes = 0;
+	if (*arg_nbytes < pf->devs_nbytes) {
+		*arg_nbytes = 0;
 		err = 0;
 		goto done;
 	}
 
-	err = copyout(pf->devs_nvlbuf, arg->buf, pf->devs_nbytes);
+	err = copyout(pf->devs_nvlbuf, arg_buf, pf->devs_nbytes);
 	if (err)
 		goto done;
 
-	arg->nbytes = pf->devs_nbytes;
+	*arg_nbytes = pf->devs_nbytes;
 
 	free(pf->devs_nvlbuf, M_NVLIST);
 	pf->devs_nvlbuf = NULL;
@@ -705,7 +811,7 @@ sndstat_unpack_user_nvlbuf(const void *unvlbuf, size_t nbytes, nvlist_t **nvl)
 	}
 	*nvl = nvlist_unpack(nvlbuf, nbytes, 0);
 	free(nvlbuf, M_DEVBUF);
-	if (nvl == NULL) {
+	if (*nvl == NULL) {
 		return (EINVAL);
 	}
 
@@ -851,20 +957,24 @@ sndstat_dsp_unpack_nvlist(const nvlist_t *nvlist, struct sndstat_userdev *ud)
 }
 
 static int
-sndstat_add_user_devs(struct sndstat_file *pf, caddr_t data)
+sndstat_add_user_devs(struct sndstat_file *pf, void *nvlbuf, size_t nbytes)
 {
 	int err;
 	nvlist_t *nvl = NULL;
 	const nvlist_t * const *dsps;
 	size_t i, ndsps;
-	struct sndstioc_nv_arg *arg = (struct sndstioc_nv_arg *)data;
 
 	if ((pf->fflags & FWRITE) == 0) {
 		err = EPERM;
 		goto done;
 	}
 
-	err = sndstat_unpack_user_nvlbuf(arg->buf, arg->nbytes, &nvl);
+	if (nbytes > SNDST_UNVLBUF_MAX) {
+		err = ENOMEM;
+		goto done;
+	}
+
+	err = sndstat_unpack_user_nvlbuf(nvlbuf, nbytes, &nvl);
 	if (err != 0)
 		goto done;
 
@@ -910,52 +1020,17 @@ sndstat_flush_user_devs(struct sndstat_file *pf)
 	return (0);
 }
 
-#ifdef COMPAT_FREEBSD32
-static int
-compat_sndstat_get_devs32(struct sndstat_file *pf, caddr_t data)
-{
-	struct sndstioc_nv_arg32 *arg32 = (struct sndstioc_nv_arg32 *)data;
-	struct sndstioc_nv_arg arg;
-	int err;
-
-	arg.buf = (void *)(uintptr_t)arg32->buf;
-	arg.nbytes = arg32->nbytes;
-
-	err = sndstat_get_devs(pf, (caddr_t)&arg);
-	if (err == 0) {
-		arg32->buf = (uint32_t)(uintptr_t)arg.buf;
-		arg32->nbytes = arg.nbytes;
-	}
-
-	return (err);
-}
-
-static int
-compat_sndstat_add_user_devs32(struct sndstat_file *pf, caddr_t data)
-{
-	struct sndstioc_nv_arg32 *arg32 = (struct sndstioc_nv_arg32 *)data;
-	struct sndstioc_nv_arg arg;
-	int err;
-
-	arg.buf = (void *)(uintptr_t)arg32->buf;
-	arg.nbytes = arg32->nbytes;
-
-	err = sndstat_add_user_devs(pf, (caddr_t)&arg);
-	if (err == 0) {
-		arg32->buf = (uint32_t)(uintptr_t)arg.buf;
-		arg32->nbytes = arg.nbytes;
-	}
-
-	return (err);
-}
-#endif
-
 static int
 sndstat_ioctl(
     struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread *td)
 {
 	int err;
 	struct sndstat_file *pf;
+	struct sndstioc_nv_arg *arg;
+#ifdef COMPAT_FREEBSD32
+	struct sndstioc_nv_arg32 *arg32;
+	size_t nbytes;
+#endif
 
 	err = devfs_get_cdevpriv((void **)&pf);
 	if (err != 0)
@@ -963,27 +1038,30 @@ sndstat_ioctl(
 
 	switch (cmd) {
 	case SNDSTIOC_GET_DEVS:
-		err = sndstat_get_devs(pf, data);
+		arg = (struct sndstioc_nv_arg *)data;
+		err = sndstat_get_devs(pf, arg->buf, &arg->nbytes);
 		break;
 #ifdef COMPAT_FREEBSD32
 	case SNDSTIOC_GET_DEVS32:
-		if (!SV_CURPROC_FLAG(SV_ILP32)) {
-			err = ENODEV;
-			break;
+		arg32 = (struct sndstioc_nv_arg32 *)data;
+		nbytes = arg32->nbytes;
+		err = sndstat_get_devs(pf, (void *)(uintptr_t)arg32->buf,
+		    &nbytes);
+		if (err == 0) {
+			KASSERT(nbytes < UINT_MAX, ("impossibly many bytes"));
+			arg32->nbytes = nbytes;
 		}
-		err = compat_sndstat_get_devs32(pf, data);
 		break;
 #endif
 	case SNDSTIOC_ADD_USER_DEVS:
-		err = sndstat_add_user_devs(pf, data);
+		arg = (struct sndstioc_nv_arg *)data;
+		err = sndstat_add_user_devs(pf, arg->buf, arg->nbytes);
 		break;
 #ifdef COMPAT_FREEBSD32
 	case SNDSTIOC_ADD_USER_DEVS32:
-		if (!SV_CURPROC_FLAG(SV_ILP32)) {
-			err = ENODEV;
-			break;
-		}
-		err = compat_sndstat_add_user_devs32(pf, data);
+		arg32 = (struct sndstioc_nv_arg32 *)data;
+		err = sndstat_add_user_devs(pf, (void *)(uintptr_t)arg32->buf,
+		    arg32->nbytes);
 		break;
 #endif
 	case SNDSTIOC_REFRESH_DEVS:

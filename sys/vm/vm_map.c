@@ -172,7 +172,7 @@ static void vm_map_wire_entry_failure(vm_map_t map, vm_map_entry_t entry,
 			start = end;			\
 		}
 
-#ifndef UMA_MD_SMALL_ALLOC
+#ifndef UMA_USE_DMAP
 
 /*
  * Allocate a new slab for kernel map entries.  The kernel map may be locked or
@@ -264,7 +264,7 @@ vm_map_startup(void)
 	kmapentzone = uma_zcreate("KMAP ENTRY", sizeof(struct vm_map_entry),
 	    NULL, NULL, NULL, NULL, UMA_ALIGN_PTR,
 	    UMA_ZONE_VM | UMA_ZONE_NOBUCKET);
-#ifndef UMA_MD_SMALL_ALLOC
+#ifndef UMA_USE_DMAP
 	/* Reserve an extra map entry for use when replenishing the reserve. */
 	uma_zone_reserve(kmapentzone, KMAPENT_RESERVE + 1);
 	uma_prealloc(kmapentzone, KMAPENT_RESERVE + 1);
@@ -660,7 +660,7 @@ _vm_map_unlock(vm_map_t map, const char *file, int line)
 
 	VM_MAP_UNLOCK_CONSISTENT(map);
 	if (map->system_map) {
-#ifndef UMA_MD_SMALL_ALLOC
+#ifndef UMA_USE_DMAP
 		if (map == kernel_map && (map->flags & MAP_REPLENISH) != 0) {
 			uma_prealloc(kmapentzone, 1);
 			map->flags &= ~MAP_REPLENISH;
@@ -937,7 +937,7 @@ vm_map_entry_create(vm_map_t map)
 {
 	vm_map_entry_t new_entry;
 
-#ifndef UMA_MD_SMALL_ALLOC
+#ifndef UMA_USE_DMAP
 	if (map == kernel_map) {
 		VM_MAP_ASSERT_LOCKED(map);
 
@@ -2247,8 +2247,15 @@ again:
 		rv = vm_map_insert(map, object, offset, *addr, *addr + length,
 		    prot, max, cow);
 	}
-	if (rv == KERN_SUCCESS && update_anon)
-		map->anon_loc = *addr + length;
+
+	/*
+	 * Update the starting address for clustered anonymous memory mappings
+	 * if a starting address was not previously defined or an ASLR restart
+	 * placed an anonymous memory mapping at a lower address.
+	 */
+	if (update_anon && rv == KERN_SUCCESS && (map->anon_loc == 0 ||
+	    *addr < map->anon_loc))
+		map->anon_loc = *addr;
 done:
 	vm_map_unlock(map);
 	return (rv);
@@ -4040,9 +4047,6 @@ vm_map_delete(vm_map_t map, vm_offset_t start, vm_offset_t end)
 		if ((entry->eflags & MAP_ENTRY_IS_SUB_MAP) != 0 ||
 		    entry->object.vm_object != NULL)
 			pmap_map_delete(map->pmap, entry->start, entry->end);
-
-		if (entry->end == map->anon_loc)
-			map->anon_loc = entry->start;
 
 		/*
 		 * Delete the entry only after removing all pmap
