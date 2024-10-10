@@ -427,6 +427,8 @@
         ..
         libkvm
         ..
+        libmd
+        ..
         libmp
         ..
         libnv
@@ -1094,6 +1096,8 @@
         dirname
         ..
         du
+        ..
+        env
         ..
         factor
         ..
